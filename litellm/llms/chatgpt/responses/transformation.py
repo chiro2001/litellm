@@ -88,6 +88,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         request["include"] = include
 
         request["input"] = self._rewrite_tool_call_ids_for_subscription(request.get("input"))
+        request["input"] = self._drop_foreign_reasoning_items(request.get("input"))
+        self._forward_codex_cache_routing(request=request, headers=headers)
 
         allowed_keys = {
             "model",
@@ -101,9 +103,76 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             "reasoning",
             "previous_response_id",
             "truncation",
+            # Codex's own transport sends these straight to this backend. The
+            # subscription endpoint uses `prompt_cache_key` (the session id) to
+            # route a conversation to the same prompt cache; dropping it here
+            # made the gateway's cache behaviour diverge from a direct
+            # connection (a replayed second turn cached ~20% of its input
+            # through the gateway versus ~95% for the same payload sent
+            # directly).
+            "prompt_cache_key",
+            "client_metadata",
+            "parallel_tool_calls",
+            "text",
         }
 
         return {k: v for k, v in request.items() if k in allowed_keys}
+
+    @staticmethod
+    def _forward_codex_cache_routing(request: dict, headers: dict) -> None:
+        """Keep the subscription session/cache identity that Codex sent.
+
+        Codex stamps a stable `session-id` header and the same value in
+        `prompt_cache_key` on every turn; both are required for the backend to
+        reuse the prompt cache across turns. `validate_environment` runs before
+        this transform and installs a fresh uuid when it cannot find a session
+        id, so override it here with the value that arrived with the request.
+        """
+        session_hint = None
+        client_metadata = request.get("client_metadata")
+        if isinstance(client_metadata, dict):
+            candidate = client_metadata.get("session_id")
+            if isinstance(candidate, str) and candidate:
+                session_hint = candidate
+        if session_hint is None:
+            candidate = request.get("prompt_cache_key")
+            if isinstance(candidate, str) and candidate:
+                session_hint = candidate
+        if session_hint is not None:
+            headers["session_id"] = session_hint
+
+    @staticmethod
+    def _drop_foreign_reasoning_items(input: Any) -> Any:
+        """Drop reasoning items this backend cannot verify, keep its own.
+
+        A ChatGPT-issued reasoning item is `rs_*` and carries an opaque
+        `gAAAA...` encrypted payload; that payload is the model's reasoning
+        state and the backend must receive it verbatim, both to continue the
+        chain of thought and to hit the prompt cache. Reasoning items produced
+        by other providers behind the same gateway (DeepSeek, for example) use
+        a client-side uuid id with plaintext `content`, which this endpoint
+        rejects outright::
+
+            Invalid 'input[186].content': array too long. Expected an array
+            with maximum length 0, but got an array with length 1 instead.
+
+            Invalid 'input[1].id': '5780e548-...'. Expected an ID that begins
+            with 'rs'.
+
+        Those items carry no information this backend can use, so they are
+        dropped from the request only; the client keeps them in its rollout and
+        they are untouched for every non-ChatGPT provider.
+        """
+        if not isinstance(input, list):
+            return input
+        kept: list[Any] = []
+        for item in input:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                item_id = item.get("id")
+                if not (isinstance(item_id, str) and item_id.startswith("rs")):
+                    continue
+            kept.append(item)
+        return kept
 
     @staticmethod
     def _rewrite_tool_call_ids_for_subscription(input: Any) -> Any:
