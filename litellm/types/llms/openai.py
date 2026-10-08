@@ -1175,6 +1175,10 @@ class ResponsesAPIOptionalRequestParams(TypedDict, total=False):
     max_tool_calls: Optional[int]
     prompt_cache_key: Optional[str]
     prompt_cache_retention: Optional[str]
+    # Codex sends turn/thread metadata here (thread_id, turn_id, session_id,
+    # x-codex-* identifiers). It is opaque to the gateway but the Codex
+    # subscription backend reads it, so pass it through instead of dropping it.
+    client_metadata: Optional[Dict[str, Any]]
     stream_options: Optional[ResponsesAPIStreamOptions]
     top_logprobs: Optional[int]
     partial_images: Optional[int]  # Number of partial images to generate (1-3) for streaming image generation
