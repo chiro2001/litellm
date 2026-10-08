@@ -91,6 +91,15 @@ async def responses_api(
         version,
     )
 
+    # Byte-exact passthrough for Codex <-> ChatGPT subscription traffic.
+    # Deployments opt in through litellm_params (auto-on for `chatgpt/...`
+    # upstreams); everything else keeps using the normal pipeline below.
+    from .raw_codex_passthrough import try_raw_codex_passthrough
+
+    raw_passthrough_response = await try_raw_codex_passthrough(request=request, llm_router=llm_router)
+    if raw_passthrough_response is not None:
+        return raw_passthrough_response
+
     data = await _read_request_body(request=request)
 
     # Check if polling via cache should be used for this request
