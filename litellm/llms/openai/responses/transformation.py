@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Any, cast, get_type_hints
 
 import httpx
+import json
 from openai.types.responses import ResponseReasoningItem
 from pydantic import BaseModel, ValidationError
 
@@ -12,6 +13,9 @@ from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response impo
 )
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
+from litellm.responses.litellm_completion_transformation.custom_tools import (
+    normalize_custom_tool_call_item,
+)
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import *
 from litellm.types.responses.main import *
@@ -150,7 +154,12 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         `remove_cache_control_flag_from_messages_and_tools`; mirror that here.
         """
 
+        if litellm_params.get("drop_metadata"):
+            response_api_optional_request_params.pop("metadata", None)
         input = self._validate_input_param(input)
+        input = self._flatten_encrypted_content_in_input(input=input, litellm_params=litellm_params)
+        input = self._normalize_custom_tool_calls_for_third_party(input=input, litellm_params=litellm_params)
+        input = self._sanitize_function_call_arguments_for_third_party(input=input, litellm_params=litellm_params)
         tools = response_api_optional_request_params.get("tools")
         input, tools = self.remove_cache_control_flag_from_input_and_tools(model=model, input=input, tools=tools)
         if tools is not None:
@@ -160,6 +169,167 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         )
 
         return final_request_params
+
+    @staticmethod
+    def _speaks_native_codex_dialect(litellm_params: GenericLiteLLMParams) -> bool:
+        """Whether this request goes to a backend that natively speaks Codex's dialect.
+
+        Two do: OpenAI's own API, and the ChatGPT subscription endpoint
+        (``chatgpt.com/backend-api/codex``) that Codex itself talks to when it
+        runs against a subscription. Everything in this class labelled "for
+        third party" exists to paper over endpoints that choke on Codex's input
+        shapes — vLLM among them — and both of those handle the shapes natively.
+        Rewriting them there is at best a loss and at worst a hard 400.
+
+        The check cannot be ``api_base`` alone. A deployment that leaves
+        ``api_base`` unset sees ``None`` here rather than the provider's default,
+        so an ``api_base``-only guard silently failed open for the subscription
+        backend: its ``custom_tool_call`` items were rewritten to
+        ``function_call`` while keeping their ``ctc_`` ids, and the backend
+        answered::
+
+            Invalid 'input[9].id': 'ctc_07c5...'. Expected an ID that begins with 'fc'.
+
+        ``chatgpt/`` in the model string is the reliable signal for the
+        subscription route — it is the prefix the provider is always configured
+        with.
+        """
+        if isinstance(litellm_params, dict):
+            api_base = litellm_params.get("api_base")
+            model = litellm_params.get("model")
+        else:
+            api_base = getattr(litellm_params, "api_base", None)
+            model = getattr(litellm_params, "model", None)
+
+        # The subscription route names itself in the model string; it never sets
+        # its own `api_base`, so this is the only place the prefix is visible.
+        if isinstance(model, str) and model.startswith("chatgpt/"):
+            return True
+
+        # No `api_base` at all means "the provider's own default", and for this
+        # class that default is OpenAI. Treating it as third-party was the
+        # fail-open that produced the 400 above, and it is the wrong guess in
+        # general: an unset base is not evidence of an unsupported endpoint.
+        if api_base is None:
+            return True
+
+        # An explicit base is the one reliable third-party signal — every
+        # non-OpenAI deployment in this gateway sets one (the DGX vLLM at
+        # 127.0.0.1:8888, SCNet, the OpenLux/ofapp/sssaicode proxies).
+        return isinstance(api_base, str) and "api.openai.com" in api_base
+
+    def _flatten_encrypted_content_in_input(
+        self,
+        input: str | ResponseInputParam,
+        litellm_params: GenericLiteLLMParams,
+    ) -> str | ResponseInputParam:
+        """Normalize Codex inter-agent input for third-party Responses endpoints.
+
+        Codex delivers inter-agent task payloads as `agent_message` input items
+        whose content blocks are `encrypted_content`; only OpenAI's backend can
+        decrypt them. Third-party Responses endpoints reject the encrypted block
+        with a 400 (unknown variant) and ignore the `agent_message` item type,
+        leaving the sub-agent with an empty task payload. Rewrite such items to
+        plain `message` items with `input_text` content whenever the upstream is
+        not OpenAI's official API.
+        """
+        if self._speaks_native_codex_dialect(litellm_params):
+            return input
+        # Per-deployment opt-out: forward the encrypted blocks verbatim so the
+        # upstream can try to decrypt them itself.
+        if isinstance(litellm_params, dict):
+            passthrough = litellm_params.get("encrypted_content_passthrough")
+        else:
+            passthrough = getattr(litellm_params, "encrypted_content_passthrough", None)
+        if passthrough is True:
+            return input
+        if not isinstance(input, list):
+            return input
+        for item in input:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            flattened_content: list[Any] = []
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "encrypted_content"
+                    and block.get("encrypted_content") is not None
+                ):
+                    flattened_content.append({"type": "input_text", "text": block["encrypted_content"]})
+                else:
+                    flattened_content.append(block)
+            item["content"] = flattened_content
+            if item.get("type") == "agent_message":
+                item["type"] = "message"
+                item["role"] = "user"
+                item.pop("author", None)
+                item.pop("recipient", None)
+        return input
+
+    def _normalize_custom_tool_calls_for_third_party(
+        self,
+        input: str | ResponseInputParam,
+        litellm_params: GenericLiteLLMParams,
+    ) -> str | ResponseInputParam:
+        """Convert Codex ``custom_tool_call`` history items to ``function_call``.
+
+        Codex sub-agents and tools (e.g. apply_patch) emit Responses API input
+        items with ``type="custom_tool_call"``. Several third-party Responses
+        endpoints (vLLM included) fail to parse those items and return 500
+        (``'ResponseCustomToolCall' object has no attribute 'get'``). For any
+        non-OpenAI upstream we rewrite them to the standard ``function_call``
+        shape so the client-facing Responses API keeps working end-to-end.
+        """
+        if self._speaks_native_codex_dialect(litellm_params):
+            return input
+        if not isinstance(input, list):
+            return input
+        for item in input:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "custom_tool_call":
+                raw_input = item.pop("input", "")
+                item["type"] = "function_call"
+                item["arguments"] = json.dumps({"input": raw_input}, ensure_ascii=False)
+            elif item.get("type") == "custom_tool_call_output":
+                item["type"] = "function_call_output"
+        return input
+
+    def _sanitize_function_call_arguments_for_third_party(
+        self,
+        input: str | ResponseInputParam,
+        litellm_params: GenericLiteLLMParams,
+    ) -> str | ResponseInputParam:
+        """Replace invalid ``function_call`` arguments with ``{}`` before forwarding.
+
+        Some backends (e.g. vLLM) reject conversation history whose
+        ``function_call`` items carry truncated/non-JSON ``arguments`` (the model
+        may have been cut off mid-string). OpenAI's API tolerates them as opaque
+        strings, but stricter third-party endpoints return 400 and abort the
+        whole turn. Normalizing invalid JSON to ``{}`` keeps the request flowing;
+        the accompanying ``function_call_output`` error text still gives the
+        model the context it needs.
+        """
+        if self._speaks_native_codex_dialect(litellm_params):
+            return input
+        if not isinstance(input, list):
+            return input
+        for item in input:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "function_call":
+                continue
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                continue
+            try:
+                json.loads(arguments)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                item["arguments"] = "{}"
+        return input
 
     def remove_cache_control_flag_from_input_and_tools(
         self,
@@ -266,6 +436,7 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         model: str,
         raw_response: httpx.Response,
         logging_obj: LiteLLMLoggingObj,
+        custom_tool_names: set[str] | None = None,
     ) -> ResponsesAPIResponse:
         """No transform applied since outputs are in OpenAI spec already"""
         try:
@@ -277,6 +448,12 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
             raw_response_json["created_at"] = _safe_convert_created_field(raw_response_json["created_at"])
         except Exception:
             raise OpenAIError(message=raw_response.text, status_code=raw_response.status_code)
+        if custom_tool_names:
+            output = raw_response_json.get("output")
+            if isinstance(output, list):
+                for item in output:
+                    if isinstance(item, dict):
+                        normalize_custom_tool_call_item(item, custom_tool_names)
         raw_response_headers = dict(raw_response.headers)
         processed_headers = process_response_headers(raw_response_headers)
         try:

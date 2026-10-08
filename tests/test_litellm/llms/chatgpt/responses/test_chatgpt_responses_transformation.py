@@ -326,3 +326,116 @@ class TestChatGPTResponsesAPITransformation:
 
         assert "ChatGPT upstream failed" in str(exc_info.value)
         assert exc_info.value.status_code == 502
+
+
+class TestSubscriptionToolCallIds:
+    """The subscription endpoint only accepts tool-call ids beginning with ``fc``.
+
+    It answers anything else with a hard 400 and aborts the whole turn::
+
+        Invalid 'input[9].id': 'ctc_07c5...'. Expected an ID that begins with 'fc'.
+
+    Codex writes ``ctc_`` ids for its freeform tools (apply_patch, shell), so a
+    session that has used one carries them in its history from then on — every
+    later turn replayed to this backend failed until the conversation was reset.
+    """
+
+    def _transform(self, input_items):
+        config = ChatGPTResponsesAPIConfig()
+        body = config.transform_responses_api_request(
+            model="chatgpt/gpt-6.1-sol",
+            input=input_items,
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(
+                model="chatgpt/gpt-6.1-sol",
+                encrypted_content_passthrough=True,
+            ),
+            headers={},
+        )
+        return body["input"]
+
+    def test_rewrites_ctco_id_on_the_output_item_too(self):
+        """The output item carries its own id, with a ``ctco_`` prefix.
+
+        A live mixed-model run caught this one after the ``ctc_`` fix was in: the
+        call went through and its *output* was rejected instead::
+
+            Invalid 'input[9].id': 'ctco_01a119e4-...'. Expected an ID that begins with 'fc'.
+
+        Replacing the leading ``ctc`` with ``fc`` maps both shapes to something
+        the backend accepts — ``ctc_…`` -> ``fc_…``, ``ctco_…`` -> ``fco_…``.
+        """
+        items = self._transform(
+            [
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_abc",
+                    "call_id": "call_1",
+                    "name": "exec",
+                    "input": "cmd",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_01a119e4-a059-75d1-8455-332ef636ce23",
+                    "call_id": "call_1",
+                    "output": "LUNA_OK",
+                },
+            ]
+        )
+        assert items[0]["id"] == "fc_abc"
+        assert items[1]["id"] == "fco_01a119e4-a059-75d1-8455-332ef636ce23"
+        # The pairing key is untouched, so the call and its output still match.
+        assert items[0]["call_id"] == items[1]["call_id"] == "call_1"
+
+    def test_rewrites_ctc_id_to_fc(self):
+        items = self._transform(
+            [
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_07c5cd0aae8dc1c7016ac7207fcfac819184252fcdcd9cc6d3",
+                    "call_id": "call_abc",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch",
+                },
+            ]
+        )
+        assert items[0]["id"] == "fc_07c5cd0aae8dc1c7016ac7207fcfac819184252fcdcd9cc6d3"
+
+    def test_leaves_the_rest_of_the_item_alone(self):
+        """Only the id prefix is rejected, so only the id is touched.
+
+        Verified against the live endpoint: `custom_tool_call` and
+        `function_call` are both accepted, and `call_id` is the pairing key the
+        output item repeats — rewriting that would break the link.
+        """
+        items = self._transform(
+            [
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_abc",
+                    "call_id": "call_abc",
+                    "name": "apply_patch",
+                    "input": "patch body",
+                },
+                {"type": "custom_tool_call_output", "call_id": "call_abc", "output": "Done"},
+            ]
+        )
+        assert items[0]["type"] == "custom_tool_call"
+        assert items[0]["call_id"] == "call_abc"
+        assert items[0]["name"] == "apply_patch"
+        assert items[0]["input"] == "patch body"
+        assert items[1]["call_id"] == "call_abc"
+
+    def test_does_not_touch_ids_that_already_conform(self):
+        items = self._transform(
+            [
+                {"type": "function_call", "id": "fc_keep", "call_id": "call_1", "name": "t", "arguments": "{}"},
+                {"type": "reasoning", "id": "rs_keep", "summary": []},
+                {"type": "message", "id": "msg_keep", "role": "user", "content": []},
+            ]
+        )
+        assert [i["id"] for i in items] == ["fc_keep", "rs_keep", "msg_keep"]
+
+    def test_passes_through_input_that_is_not_a_list(self):
+        config = ChatGPTResponsesAPIConfig()
+        assert config._rewrite_tool_call_ids_for_subscription("plain string") == "plain string"

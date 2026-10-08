@@ -630,6 +630,30 @@ def _apply_prompt_management_to_responses_call(
     return input, model, custom_llm_provider
 
 
+def _normalize_openai_responses_reasoning_input(
+    input_value: str | ResponseInputParam,
+) -> str | ResponseInputParam:
+    """Normalize reasoning items for OpenAI-compatible Responses upstreams.
+
+    Some compatible backends (e.g. ofapp/sss proxies) reject reasoning input items
+    whose ``content`` array is non-empty or that carry an opaque
+    ``encrypted_content`` field, returning a generic "Upstream request failed" /
+    array_above_max_length error.
+    """
+    if not isinstance(input_value, list):
+        return input_value
+    normalized: list[Any] = []
+    for item in input_value:
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            new_item = dict(item)
+            new_item["content"] = []
+            new_item.pop("encrypted_content", None)
+            normalized.append(new_item)
+        else:
+            normalized.append(item)
+    return cast(str | ResponseInputParam, normalized)
+
+
 # Opt-in via model id (mirrors the `responses/` prefix pattern on chat completions).
 _OPENAI_CHAT_COMPLETIONS_RESPONSES_MODEL_PREFIX = "openai/chat_completions/"
 
@@ -964,6 +988,12 @@ def responses(
         # Update input and tools with provider-specific file IDs if managed files are used
         #########################################################
         input, tools = _apply_managed_file_id_mapping(input=input, tools=tools, kwargs=kwargs, local_vars=local_vars)
+
+        # Compat: some OpenAI-compatible Responses upstreams reject reasoning input
+        # items with non-empty content / encrypted_content.
+        if custom_llm_provider == "openai":
+            input = _normalize_openai_responses_reasoning_input(input)
+            local_vars["input"] = input
 
         #########################################################
         # Native MCP Responses API

@@ -100,6 +100,7 @@ class PerplexityResponsesConfig(OpenAIResponsesAPIConfig):
         model: str,
         raw_response: httpx.Response,
         logging_obj: LiteLLMLoggingObj,
+        custom_tool_names: set[str] | None = None,
     ) -> ResponsesAPIResponse:
         """Check for Perplexity's status:'failed' on HTTP 200 before delegating to base."""
         try:
@@ -118,6 +119,7 @@ class PerplexityResponsesConfig(OpenAIResponsesAPIConfig):
             model=model,
             raw_response=raw_response,
             logging_obj=logging_obj,
+            custom_tool_names=custom_tool_names,
         )
 
     def supports_native_websocket(self) -> bool:

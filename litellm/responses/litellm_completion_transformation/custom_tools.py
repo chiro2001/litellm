@@ -27,6 +27,8 @@ from litellm.types.llms.openai import (
 )
 
 _MAX_ARGUMENTS_LEN = 1_000_000
+_MAX_UNWRAP_DEPTH = 10
+_UNWRAP_KEYS = ("patch", "content", "input", "text", "arguments")
 
 
 def extract_custom_tool_names(tools: list[Any] | None) -> set[str]:
@@ -65,6 +67,97 @@ def unwrap_custom_tool_arguments(arguments: str) -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
     return arguments
+
+
+def unwrap_custom_tool_input(arguments: str, _depth: int = 0) -> str:
+    """Recursively extract the raw freeform input from JSON-wrapped arguments.
+
+    Passthrough Responses backends (e.g. vLLM) return custom-tool invocations as
+    ``function_call`` items whose ``arguments`` JSON may wrap the actual input
+    under keys such as ``patch``, ``content``, ``input``, ``text`` or
+    ``arguments``. The model frequently nests these wrappers several levels deep
+    (``{"arguments": {"input": "..."}}`` and deeper), so the unwrap is recursive
+    until it reaches a plain string that is not itself JSON. Returns the
+    original JSON when nothing can be safely unwrapped.
+    """
+    if _depth > _MAX_UNWRAP_DEPTH or not arguments:
+        return arguments
+    if len(arguments) > _MAX_ARGUMENTS_LEN:
+        return arguments
+
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return arguments
+
+    if isinstance(parsed, str):
+        # A JSON string literal: the payload itself (e.g. `"*** Begin Patch..."`).
+        return parsed
+
+    if isinstance(parsed, list) and len(parsed) == 1:
+        value = parsed[0]
+        if isinstance(value, str):
+            if value.lstrip().startswith(("{", "[")):
+                return unwrap_custom_tool_input(value, _depth + 1)
+            return value
+        if isinstance(value, (dict, list)):
+            return unwrap_custom_tool_input(
+                json.dumps(value, ensure_ascii=False), _depth + 1
+            )
+
+    if isinstance(parsed, dict):
+        # Known wrapper keys first, in priority order.
+        for key in _UNWRAP_KEYS:
+            if key not in parsed:
+                continue
+            value = parsed[key]
+            if isinstance(value, str):
+                if value.lstrip().startswith(("{", "[")):
+                    return unwrap_custom_tool_input(value, _depth + 1)
+                return value
+            if isinstance(value, (dict, list)):
+                return unwrap_custom_tool_input(
+                    json.dumps(value, ensure_ascii=False), _depth + 1
+                )
+        # Single-key objects are treated as wrappers even with unknown keys.
+        if len(parsed) == 1:
+            value = next(iter(parsed.values()))
+            if isinstance(value, str):
+                if value.lstrip().startswith(("{", "[")):
+                    return unwrap_custom_tool_input(value, _depth + 1)
+                return value
+            if isinstance(value, (dict, list)):
+                return unwrap_custom_tool_input(
+                    json.dumps(value, ensure_ascii=False), _depth + 1
+                )
+        return json.dumps(parsed, ensure_ascii=False)
+
+    return arguments
+
+
+def normalize_custom_tool_call_item(
+    item: dict[str, Any],
+    custom_tool_names: set[str],
+    *,
+    input_override: str | None = None,
+) -> bool:
+    """Rewrite a ``function_call`` output item into ``custom_tool_call`` in place.
+
+    Only items whose name was declared as a custom tool are rewritten. Returns
+    True when the item was converted.
+    """
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return False
+    name = item.get("name")
+    if not isinstance(name, str) or name not in custom_tool_names:
+        return False
+    raw = input_override if input_override is not None else str(item.get("arguments") or "")
+    item["type"] = "custom_tool_call"
+    item["input"] = unwrap_custom_tool_input(raw)
+    item.pop("arguments", None)
+    item.pop("caller", None)
+    item.pop("status", None)
+    return True
 
 
 def build_tool_call_item_kwargs(

@@ -87,6 +87,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             include.append("reasoning.encrypted_content")
         request["include"] = include
 
+        request["input"] = self._rewrite_tool_call_ids_for_subscription(request.get("input"))
+
         allowed_keys = {
             "model",
             "input",
@@ -103,11 +105,53 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
         return {k: v for k, v in request.items() if k in allowed_keys}
 
+    @staticmethod
+    def _rewrite_tool_call_ids_for_subscription(input: Any) -> Any:
+        """Rewrite tool-call ids to the ``fc_`` form this backend demands.
+
+        The subscription endpoint validates that a tool call's ``id`` begins
+        with ``fc`` and rejects anything else outright::
+
+            Invalid 'input[9].id': 'ctc_07c5...'. Expected an ID that begins with 'fc'.
+
+        Codex writes ``ctc_`` ids whenever it drives a freeform tool —
+        ``apply_patch`` and ``shell`` are the common ones — so a session that has
+        used either carries those ids in its history from then on, and every
+        later turn replayed to this backend fails with the 400 above until the
+        conversation is reset.
+
+        Verified against the live endpoint: the ``type`` is not what is checked.
+        Both ``custom_tool_call`` and ``function_call`` are accepted; only the id
+        prefix is enforced. So this rewrites the id and leaves everything else
+        alone, which keeps the item's meaning intact.
+
+        Two prefixes show up in practice, on different items:
+
+        - ``ctc_``  on a ``custom_tool_call``
+        - ``ctco_`` on its ``custom_tool_call_output``
+
+        Both are rewritten by replacing the leading ``ctc`` with ``fc``, which
+        turns them into ``fc_…`` and ``fco_…`` — the two shapes the backend
+        accepts. Only the item's own ``id`` is touched: the linkage between a
+        call and its output is ``call_id``, which already has the right
+        ``call_`` form and is left alone.
+        """
+        if not isinstance(input, list):
+            return input
+        for item in input:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id.startswith("ctc"):
+                item["id"] = "fc" + item_id[len("ctc"):]
+        return input
+
     def transform_response_api_response(
         self,
         model: str,
         raw_response: Any,
         logging_obj: Any,
+        custom_tool_names: set[str] | None = None,
     ):
         body_text = raw_response.text or ""
         if not self._should_parse_as_sse(raw_response=raw_response, body_text=body_text):
@@ -115,6 +159,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
                 model=model,
                 raw_response=raw_response,
                 logging_obj=logging_obj,
+                custom_tool_names=custom_tool_names,
             )
 
         logging_obj.post_call(

@@ -30,6 +30,11 @@ from litellm.litellm_core_utils.llm_response_utils.response_metadata import (
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
 from litellm.responses.utils import ResponseAPILoggingUtils, ResponsesAPIRequestUtils
+from litellm.responses.litellm_completion_transformation.custom_tools import (
+    extract_custom_tool_names,
+    normalize_custom_tool_call_item,
+    unwrap_custom_tool_input,
+)
 from litellm.types.llms.openai import ResponsesAPIStreamEvents
 from litellm.types.utils import CallTypes
 from litellm.utils import async_post_call_success_deployment_hook
@@ -141,6 +146,9 @@ class BaseResponsesAPIStreamingIterator:
         self._completed_response_cache_hit: bool | None = None
         self._persist_completed_response_before_logging = True
         self._stream_created_time: float = time.time()
+        self._custom_tool_names_cache: set[str] | None = None
+        self._custom_tool_item_names: dict[str, str] = {}
+        self._custom_tool_arguments_buffers: dict[str, str] = {}
 
         # track request context for hooks
         self.litellm_metadata = litellm_metadata
@@ -163,6 +171,132 @@ class BaseResponsesAPIStreamingIterator:
         self._hidden_params["additional_headers"] = process_response_headers(
             self.response.headers or {}
         )  # GUARANTEE OPENAI HEADERS IN RESPONSE
+
+    def _custom_tool_names(self) -> set[str]:
+        """Names of tools the client declared as ``type: "custom"``."""
+        if self._custom_tool_names_cache is None:
+            from litellm.responses.litellm_completion_transformation.custom_tools import (
+                extract_custom_tool_names,
+            )
+
+            tools = self.request_data.get("tools")
+            if not isinstance(tools, list):
+                def _find_tools(obj: Any, _seen: set[int] | None = None) -> list[Any] | None:
+                    if _seen is None:
+                        _seen = set()
+                    obj_id = id(obj)
+                    if obj_id in _seen:
+                        return None
+                    _seen.add(obj_id)
+                    if isinstance(obj, dict):
+                        candidate = obj.get("tools")
+                        if isinstance(candidate, list):
+                            return candidate
+                        for value in obj.values():
+                            found = _find_tools(value, _seen)
+                            if found is not None:
+                                return found
+                    elif isinstance(obj, list):
+                        for value in obj:
+                            found = _find_tools(value, _seen)
+                            if found is not None:
+                                return found
+                    return None
+
+                tools = _find_tools(self.request_data)
+            self._custom_tool_names_cache = extract_custom_tool_names(tools)
+        return self._custom_tool_names_cache
+
+    @staticmethod
+    def _unwrap_custom_tool_arguments(arguments: str) -> str:
+        """Extract the raw tool input from JSON-wrapped function arguments."""
+        return unwrap_custom_tool_input(arguments)
+
+    def _normalize_custom_tool_call_item(
+        self, item: dict[str, Any], *, input_override: str | None = None
+    ) -> None:
+        """Convert a passthrough ``function_call`` item into ``custom_tool_call``."""
+        normalize_custom_tool_call_item(
+            item,
+            self._custom_tool_names(),
+            input_override=input_override,
+        )
+
+    def _normalize_custom_tool_calls_in_chunk(self, parsed_chunk: dict[str, Any]) -> bool:
+        """Rewrite passthrough custom-tool items before pydantic transformation.
+
+        Third-party Responses backends (vLLM included) return custom-tool
+        invocations as ordinary ``function_call`` items with JSON-wrapped
+        ``arguments``. Codex requires ``custom_tool_call`` items with a plain
+        ``input`` string. This rewrites output items and drops the
+        ``function_call_arguments`` delta/done events for those tools, attaching
+        the complete input to the final ``output_item.done`` item instead.
+
+        Returns True when the event should be dropped from the stream.
+        """
+        if not isinstance(parsed_chunk, dict):
+            return False
+        custom_tool_names = self._custom_tool_names()
+        if not custom_tool_names:
+            return False
+
+        event_type = parsed_chunk.get("type")
+
+        # output_item.added / output_item.done items
+        item = parsed_chunk.get("item")
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and isinstance(item.get("name"), str)
+            and item["name"] in custom_tool_names
+        ):
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                self._custom_tool_item_names[item_id] = item["name"]
+            complete_input: str | None = None
+            if event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE:
+                buffered = ""
+                if isinstance(item_id, str) and item_id in self._custom_tool_arguments_buffers:
+                    buffered = self._custom_tool_arguments_buffers.pop(item_id, "")
+                complete_input = buffered or str(item.get("arguments") or "")
+            self._normalize_custom_tool_call_item(item, input_override=complete_input)
+            return False
+
+        # response.created / response.in_progress / response.completed full objects
+        response_obj = parsed_chunk.get("response")
+        if isinstance(response_obj, dict):
+            output = response_obj.get("output")
+            if isinstance(output, list):
+                for output_item in output:
+                    if isinstance(output_item, dict):
+                        self._normalize_custom_tool_call_item(output_item)
+
+        # streamed argument deltas/done for custom tool calls: buffer and drop
+        item_id = parsed_chunk.get("item_id")
+        if isinstance(item_id, str) and item_id in self._custom_tool_item_names:
+            if event_type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA:
+                delta = parsed_chunk.get("delta")
+                if isinstance(delta, str):
+                    self._custom_tool_arguments_buffers[item_id] = (
+                        self._custom_tool_arguments_buffers.get(item_id, "") + delta
+                    )
+                return True
+            if event_type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE:
+                self._custom_tool_arguments_buffers.pop(item_id, None)
+                return True
+        return False
+
+    def _normalize_custom_tool_call_output(self, response_obj: Any) -> None:
+        """Normalize the final ``response.output`` list in completed payloads."""
+        if isinstance(response_obj, dict):
+            output = response_obj.get("output")
+        else:
+            output = getattr(response_obj, "output", None)
+        if not isinstance(output, list):
+            return
+        for item in output:
+            if isinstance(item, dict):
+                self._normalize_custom_tool_call_item(item)
 
     def _check_max_streaming_duration(self) -> None:
         """Raise litellm.Timeout if the stream has exceeded LITELLM_MAX_STREAMING_DURATION_SECONDS."""
@@ -197,6 +331,8 @@ class BaseResponsesAPIStreamingIterator:
         try:
             # Parse the JSON chunk
             parsed_chunk = json.loads(chunk)
+            if self._normalize_custom_tool_calls_in_chunk(parsed_chunk):
+                return None
 
             # Format as ResponsesAPIStreamingResponse
             if isinstance(parsed_chunk, dict):
@@ -214,6 +350,7 @@ class BaseResponsesAPIStreamingIterator:
                 if "response" in parsed_chunk:
                     response_object = getattr(openai_responses_api_chunk, "response", None)
                     if response_object is not None:
+                        self._normalize_custom_tool_call_output(response_object)
                         response = ResponsesAPIRequestUtils._update_responses_api_response_id_with_model_id(
                             responses_api_response=response_object,
                             litellm_metadata=self.litellm_metadata,
@@ -236,6 +373,8 @@ class BaseResponsesAPIStreamingIterator:
                 ):
                     _item = getattr(openai_responses_api_chunk, "item", None)
                     if _item is not None:
+                        if isinstance(_item, dict):
+                            self._normalize_custom_tool_call_item(_item)
                         ResponsesAPIRequestUtils._encode_container_id_on_output_item(
                             item=_item,
                             custom_llm_provider=self.custom_llm_provider,
@@ -861,10 +1000,12 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         request_data: dict[str, Any] | None = None,
         call_type: str | None = None,
     ):
+        custom_tool_names = extract_custom_tool_names(request_data.get("tools")) if request_data else None
         transformed = responses_api_provider_config.transform_response_api_response(
             model=model,
             raw_response=response,
             logging_obj=logging_obj,
+            custom_tool_names=custom_tool_names,
         )
         super().__init__(
             response=httpx.Response(200),

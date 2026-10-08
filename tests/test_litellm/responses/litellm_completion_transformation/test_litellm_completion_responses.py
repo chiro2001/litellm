@@ -2788,6 +2788,58 @@ class TestCacheControlPreservation:
         assert result[0]["cache_control"] == {"type": "ephemeral"}
 
 
+class TestEncryptedContentFlattening:
+    def test_encrypted_content_flattened_to_text(self):
+        """Codex inter-agent task payloads arrive as `encrypted_content` blocks;
+        they must be flattened to plain text so non-OpenAI chat completions
+        backends do not lose the task body."""
+        content = [
+            {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+            {"type": "encrypted_content", "encrypted_content": "Reply with exactly: REPRO-TOKEN-7788"},
+        ]
+        result = LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
+            content
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[1] == {"type": "text", "text": "Reply with exactly: REPRO-TOKEN-7788"}
+
+    def test_agent_message_item_becomes_user_message(self):
+        """Codex delivers inter-agent tasks as `agent_message` items without a
+        `role`; the chat completion conversion must emit a `user` message whose
+        content includes the flattened encrypted payload."""
+        input_item = {
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/test",
+            "content": [
+                {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                {"type": "encrypted_content", "encrypted_content": "Reply with exactly: REPRO-TOKEN-7788"},
+            ],
+        }
+        messages = LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
+            input_item
+        )
+        assert len(messages) == 1
+        msg = messages[0]
+        msg_content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        assert msg_content[-1] == {"type": "text", "text": "Reply with exactly: REPRO-TOKEN-7788"}
+
+    def test_encrypted_content_with_null_text_skipped(self):
+        """A malformed `encrypted_content` block without a payload must be
+        skipped rather than raising."""
+        content = [
+            {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+            {"type": "encrypted_content", "encrypted_content": None},
+        ]
+        result = LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
+            content
+        )
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0] == {"type": "text", "text": "Message Type: NEW_TASK\nPayload:\n"}
+
+
 def test_function_call_tool_id_falls_back_to_unique_id_for_degenerate_call_id():
     """Bedrock Mantle returns a non-unique, index-based ``call_id`` (``call_0`` that
     resets every response) alongside a unique ``id`` (``fc_...``). For that degenerate

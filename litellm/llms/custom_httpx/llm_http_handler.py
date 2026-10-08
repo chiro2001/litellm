@@ -81,6 +81,9 @@ from litellm.responses.streaming_iterator import (
     ResponsesWebSocketStreaming,
     SyncResponsesAPIStreamingIterator,
 )
+from litellm.responses.litellm_completion_transformation.custom_tools import (
+    extract_custom_tool_names,
+)
 from litellm.types.containers.main import (
     ContainerFileListResponse,
     ContainerListResponse,
@@ -2550,6 +2553,7 @@ class BaseLLMHTTPHandler:
         # Needed by streaming callbacks/metadata helpers to reconstruct api_base/model_id
         # but never included in the outbound provider payload.
         request_context["litellm_params"] = dict(litellm_params)
+        custom_tool_names = extract_custom_tool_names(request_context.get("tools")) or None
 
         is_stream_request = bool(stream)
         if is_stream_request and fake_stream is True:
@@ -2633,6 +2637,7 @@ class BaseLLMHTTPHandler:
             model=model,
             raw_response=response,
             logging_obj=logging_obj,
+            custom_tool_names=custom_tool_names,
         )
 
         if self._has_agentic_completion_hook(logging_obj):
@@ -2727,6 +2732,7 @@ class BaseLLMHTTPHandler:
         # Needed by streaming callbacks/metadata helpers to reconstruct api_base/model_id
         # but never included in the outbound provider payload.
         request_context["litellm_params"] = dict(litellm_params)
+        custom_tool_names = extract_custom_tool_names(request_context.get("tools")) or None
 
         is_stream_request = bool(stream)
         if is_stream_request and fake_stream is True:
@@ -2810,6 +2816,7 @@ class BaseLLMHTTPHandler:
             model=model,
             raw_response=response,
             logging_obj=logging_obj,
+            custom_tool_names=custom_tool_names,
         )
 
         final_response = await self._call_agentic_completion_hooks(

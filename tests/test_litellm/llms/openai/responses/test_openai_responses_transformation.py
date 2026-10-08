@@ -224,6 +224,132 @@ class TestOpenAIResponsesAPIConfig:
 
         assert result["input"] == input_clean
 
+    def test_transform_flattens_encrypted_content_for_custom_api_base(self):
+        """Codex delivers inter-agent tasks as `encrypted_content` blocks that
+        only OpenAI's backend can decrypt. Custom Responses endpoints reject or
+        drop the block, so it must be flattened to plain `input_text` when the
+        upstream is not OpenAI's official API."""
+        input_with_encrypted_content = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\n",
+                    },
+                    {"type": "encrypted_content", "encrypted_content": "Reply with exactly: REPRO-TOKEN-7788"},
+                ],
+            }
+        ]
+
+        result = self.config.transform_responses_api_request(
+            model=self.model,
+            input=input_with_encrypted_content,
+            response_api_optional_request_params={},
+            litellm_params={"api_base": "https://api.deepseek.com/v1"},
+            headers={},
+        )
+
+        content = result["input"][0]["content"]
+        assert content[-1] == {"type": "input_text", "text": "Reply with exactly: REPRO-TOKEN-7788"}
+
+    def test_transform_preserves_encrypted_content_for_official_openai(self):
+        """The official OpenAI backend decrypts `encrypted_content` server-side,
+        so the block must be left untouched when the upstream is api.openai.com."""
+        input_with_encrypted_content = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\n",
+                    },
+                    {"type": "encrypted_content", "encrypted_content": "Reply with exactly: REPRO-TOKEN-7788"},
+                ],
+            }
+        ]
+
+        result = self.config.transform_responses_api_request(
+            model=self.model,
+            input=input_with_encrypted_content,
+            response_api_optional_request_params={},
+            litellm_params={"api_base": "https://api.openai.com/v1"},
+            headers={},
+        )
+
+        assert result["input"][0]["content"][1]["type"] == "encrypted_content"
+
+    def test_transform_converts_agent_message_item_for_custom_api_base(self):
+        """Codex sends inter-agent tasks as `agent_message` items; third-party
+        Responses endpoints ignore that item type, so it must be rewritten as a
+        plain `user` message when the upstream is not OpenAI's official API."""
+        input_with_agent_message = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "You are a test subagent."}],
+            },
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/test",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\n",
+                    },
+                    {"type": "encrypted_content", "encrypted_content": "Reply with exactly: REPRO-TOKEN-7788"},
+                ],
+            },
+        ]
+
+        result = self.config.transform_responses_api_request(
+            model=self.model,
+            input=input_with_agent_message,
+            response_api_optional_request_params={},
+            litellm_params={"api_base": "https://api.deepseek.com/v1"},
+            headers={},
+        )
+
+        item = result["input"][1]
+        assert item["type"] == "message"
+        assert item["role"] == "user"
+        assert "author" not in item and "recipient" not in item
+        assert item["content"][-1] == {"type": "input_text", "text": "Reply with exactly: REPRO-TOKEN-7788"}
+
+    def test_transform_preserves_agent_message_item_for_official_openai(self):
+        """The official OpenAI backend expands `agent_message` items and their
+        `encrypted_content` blocks server-side, so they must be left untouched
+        when the upstream is api.openai.com."""
+        input_with_agent_message = [
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/test",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\n",
+                    },
+                    {"type": "encrypted_content", "encrypted_content": "Reply with exactly: REPRO-TOKEN-7788"},
+                ],
+            }
+        ]
+
+        result = self.config.transform_responses_api_request(
+            model=self.model,
+            input=input_with_agent_message,
+            response_api_optional_request_params={},
+            litellm_params={"api_base": "https://api.openai.com/v1"},
+            headers={},
+        )
+
+        item = result["input"][0]
+        assert item["type"] == "agent_message"
+        assert item["content"][1]["type"] == "encrypted_content"
+
     def test_transform_streaming_response(self):
         """Test streaming response transformation"""
         # Test with a text delta event

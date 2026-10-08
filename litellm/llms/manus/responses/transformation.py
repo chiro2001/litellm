@@ -12,6 +12,9 @@ from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response impo
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment
 from litellm.llms.openai.common_utils import OpenAIError
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+from litellm.responses.litellm_completion_transformation.custom_tools import (
+    normalize_custom_tool_call_item,
+)
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import (
     ResponseAPIUsage,
@@ -166,6 +169,7 @@ class ManusResponsesAPIConfig(OpenAIResponsesAPIConfig):
         model: str,
         raw_response: httpx.Response,
         logging_obj: LiteLLMLoggingObj,
+        custom_tool_names: set[str] | None = None,
     ) -> ResponsesAPIResponse:
         """
         Transform Manus API response to OpenAI-compatible format.
@@ -215,6 +219,13 @@ class ManusResponsesAPIConfig(OpenAIResponsesAPIConfig):
             # Generate a placeholder id for failed responses
             # This allows the response object to be created even when the API doesn't return an id
             raw_response_json["id"] = f"unknown-{uuid.uuid4().hex[:8]}"
+
+        if custom_tool_names:
+            output = raw_response_json.get("output")
+            if isinstance(output, list):
+                for item in output:
+                    if isinstance(item, dict):
+                        normalize_custom_tool_call_item(item, custom_tool_names)
 
         try:
             response = ResponsesAPIResponse.model_validate(raw_response_json)
