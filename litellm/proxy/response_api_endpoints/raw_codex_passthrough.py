@@ -49,6 +49,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
+from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
@@ -80,6 +83,9 @@ _HOP_BY_HOP_HEADERS = frozenset(
 
 # Replaced with the gateway's own credential rather than forwarded.
 _REPLACED_REQUEST_HEADERS = frozenset({b"authorization"})
+
+_WEB_SEARCH_TOOL_PREFIX = "web_search"
+_WEB_SEARCH_COMPAT_TOOL: dict[str, Any] = {"type": "web_search", "external_web_access": False}
 
 # Recomputed when streaming, or meaningless for a body we re-emit ourselves.
 _DROPPED_RESPONSE_HEADERS = frozenset(
@@ -221,18 +227,59 @@ def _build_forward_headers(request: Request, payload: dict, access_token: str) -
 
 
 def _body_for_upstream(raw_body: bytes, payload: dict, target: RawPassthroughTarget) -> bytes:
-    """The exact request body, unless the upstream model name must be rewritten."""
-    if payload.get("model") == target.upstream_model:
+    reasons: list[str] = []
+    rewritten: dict | None = None
+    if payload.get("model") != target.upstream_model:
+        rewritten = dict(payload)
+        rewritten["model"] = target.upstream_model
+        reasons.append(f"model {payload.get('model')!r} -> {target.upstream_model!r}")
+    compat = _web_search_compat_payload(rewritten if rewritten is not None else payload)
+    if compat is not None:
+        rewritten = compat
+        reasons.append("restored web_search declaration for replayed web_search_call")
+    if rewritten is None:
         return raw_body
-    rewritten = dict(payload)
-    rewritten["model"] = target.upstream_model
     verbose_proxy_logger.warning(
-        "raw_codex_passthrough: deployment %s maps to upstream model %s; rewriting the model field "
-        "re-serializes this request and is no longer byte-exact",
+        "raw_codex_passthrough: deployment %s request rewritten (%s); no longer byte-exact",
         target.model_name,
-        target.upstream_model,
+        "; ".join(reasons),
     )
     return json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _replays_web_search_call(payload: dict) -> bool:
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return False
+    return any(isinstance(item, dict) and item.get("type") == "web_search_call" for item in items)
+
+
+def _declares_web_search(*tool_lists: Any) -> bool:
+    for tools in tool_lists:
+        if not isinstance(tools, list):
+            continue
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = tool.get("type")
+            if isinstance(tool_type, str) and tool_type.startswith(_WEB_SEARCH_TOOL_PREFIX):
+                return True
+    return False
+
+
+def _web_search_compat_payload(payload: dict) -> dict | None:
+    if not _replays_web_search_call(payload):
+        return None
+    if _declares_web_search(payload.get("tools"), payload.get("additional_tools")):
+        return None
+    rewritten = dict(payload)
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        rewritten["tools"] = [*tools, dict(_WEB_SEARCH_COMPAT_TOOL)]
+    else:
+        rewritten["tools"] = [dict(_WEB_SEARCH_COMPAT_TOOL)]
+        rewritten["tool_choice"] = "none"
+    return rewritten
 
 
 def _force_token_refresh() -> str | None:
@@ -260,6 +307,21 @@ async def _send(
     return await client.send(request, stream=True)
 
 
+def _dump_bodies(raw_body: bytes, body: bytes) -> None:
+    directory = os.environ.get("CODEX_RAW_PASSTHROUGH_DUMP_DIR")
+    if not directory:
+        return
+    try:
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        name = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:8]}"
+        (target / f"{name}-request.json").write_bytes(raw_body)
+        if body is not raw_body:
+            (target / f"{name}-forwarded.json").write_bytes(body)
+    except OSError as exc:
+        verbose_proxy_logger.warning("raw_codex_passthrough: body dump failed: %s", exc)
+
+
 async def _forward(
     request: Request,
     raw_body: bytes,
@@ -269,6 +331,9 @@ async def _forward(
     access_token = Authenticator().get_access_token()
     headers = _build_forward_headers(request, payload, access_token)
     body = _body_for_upstream(raw_body, payload, target)
+    _dump_bodies(raw_body, body)
+    if body is not raw_body:
+        headers = [(name, value) for name, value in headers if name.lower() != b"content-encoding"]
 
     client = await _get_shared_client()
     try:

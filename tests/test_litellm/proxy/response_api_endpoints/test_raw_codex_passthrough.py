@@ -1,11 +1,13 @@
 """Unit tests for the byte-exact ChatGPT subscription passthrough."""
 
+import json
 from unittest.mock import MagicMock
 
 from litellm.proxy.response_api_endpoints.raw_codex_passthrough import (
     RawPassthroughTarget,
     _body_for_upstream,
     _resolve_target,
+    _web_search_compat_payload,
 )
 
 
@@ -91,3 +93,63 @@ def test_body_is_rewritten_when_the_upstream_model_differs():
 
     assert rewritten != raw
     assert b'"model":"gpt-6-luna"' in rewritten
+
+
+def _compaction_shaped_payload(tools_marker=..., tool_choice_marker=...):
+    payload = {
+        "model": "gpt-6.1-sol",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {
+                "type": "web_search_call",
+                "id": "ws_00000000000000000001",
+                "status": "completed",
+                "action": {"type": "search", "query": "example"},
+            },
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "found"}]},
+        ],
+        "stream": True,
+        "store": False,
+    }
+    if tools_marker is not ...:
+        payload["tools"] = tools_marker
+    if tool_choice_marker is not ...:
+        payload["tool_choice"] = tool_choice_marker
+    return payload
+
+
+def test_compaction_request_gets_the_missing_web_search_declaration():
+    payload = _compaction_shaped_payload(tools_marker=[], tool_choice_marker="auto")
+
+    rewritten = _web_search_compat_payload(payload)
+
+    assert rewritten is not None
+    assert rewritten["tools"] == [{"type": "web_search", "external_web_access": False}]
+    assert rewritten["tool_choice"] == "none"
+    assert rewritten["input"] == payload["input"]
+
+
+def test_declared_web_search_is_left_alone():
+    payload = _compaction_shaped_payload(tools_marker=[{"type": "web_search"}], tool_choice_marker="auto")
+
+    assert _web_search_compat_payload(payload) is None
+
+
+def test_search_free_history_needs_no_rewrite():
+    payload = _compaction_shaped_payload(tools_marker=[])
+    payload["input"] = [item for item in payload["input"] if item.get("type") != "web_search_call"]
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    target = RawPassthroughTarget("gpt-6.1-sol", "gpt-6.1-sol", "https://example.test/responses")
+
+    assert _body_for_upstream(raw, payload, target) is raw
+
+
+def test_model_and_declaration_rewrites_combine():
+    payload = _compaction_shaped_payload(tools_marker=[])
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    target = RawPassthroughTarget("gpt-6.1-sol", "gpt-6.1-sol-2026", "https://example.test/responses")
+
+    parsed = json.loads(_body_for_upstream(raw, payload, target))
+
+    assert parsed["model"] == "gpt-6.1-sol-2026"
+    assert parsed["tools"] == [{"type": "web_search", "external_web_access": False}]
