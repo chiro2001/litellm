@@ -48,14 +48,16 @@ request byte-identical.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 from uuid import uuid4
 
 import httpx
+import zstandard
 from fastapi import Request
 from starlette.responses import Response, StreamingResponse
 
@@ -99,6 +101,9 @@ _DROPPED_RESPONSE_HEADERS = frozenset(
 )
 
 _CLIENT_TIMEOUT = httpx.Timeout(connect=15.0, read=900.0, write=60.0, pool=15.0)
+_CODEX_REQUEST_COMPRESSION_LEVEL = 3
+
+RequestCompression = Literal["zstd"]
 
 _shared_client: httpx.AsyncClient | None = None
 _shared_client_lock = asyncio.Lock()
@@ -107,10 +112,17 @@ _shared_client_lock = asyncio.Lock()
 class RawPassthroughTarget:
     """Resolved deployment for a byte-exact forward."""
 
-    __slots__ = ("model_name", "upstream_model", "upstream_url")
+    __slots__ = ("model_name", "request_compression", "upstream_model", "upstream_url")
 
-    def __init__(self, model_name: str, upstream_model: str, upstream_url: str) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        upstream_model: str,
+        upstream_url: str,
+        request_compression: RequestCompression | None = None,
+    ) -> None:
         self.model_name = model_name
+        self.request_compression = request_compression
         self.upstream_model = upstream_model
         self.upstream_url = upstream_url
 
@@ -121,6 +133,15 @@ def _deployment_flag(litellm_params: Any, key: str) -> Any:
     if callable(getter):
         return getter(key)
     return getattr(litellm_params, key, None)
+
+
+def _request_compression(litellm_params: Any, model_name: str) -> RequestCompression | None:
+    value = _deployment_flag(litellm_params, "raw_codex_request_compression")
+    if value is None or value is False:
+        return None
+    if value == "zstd":
+        return "zstd"
+    raise ValueError(f"raw_codex_request_compression for {model_name!r} must be omitted, false, or 'zstd'")
 
 
 def _resolve_target(llm_router: Any, model_name: str) -> RawPassthroughTarget | None:
@@ -163,6 +184,7 @@ def _resolve_target(llm_router: Any, model_name: str) -> RawPassthroughTarget | 
         model_name=model_name,
         upstream_model=upstream_model,
         upstream_url=upstream_url,
+        request_compression=_request_compression(litellm_params, model_name),
     )
 
 
@@ -247,6 +269,61 @@ def _body_for_upstream(raw_body: bytes, payload: dict, target: RawPassthroughTar
     return json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False).encode()
 
 
+def _decode_request_body(raw_body: bytes, encoding: str | None) -> bytes | None:
+    normalized = (encoding or "identity").lower()
+    try:
+        if normalized == "gzip":
+            return gzip.decompress(raw_body)
+        if normalized == "zstd":
+            return zstandard.ZstdDecompressor().decompress(raw_body, max_output_size=128 * 1024 * 1024)
+        if normalized in {"identity", ""}:
+            return raw_body
+    except (OSError, zstandard.ZstdError):
+        return None
+    return None
+
+
+def _decoded_payload(decoded_body: bytes) -> dict | None:
+    try:
+        payload = json.loads(decoded_body)
+    except (ValueError, UnicodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _prepare_upstream_body(
+    raw_body: bytes,
+    decoded_body: bytes,
+    payload: dict,
+    target: RawPassthroughTarget,
+    request_encoding: str | None,
+) -> tuple[bytes, str | None]:
+    if target.request_compression == "zstd":
+        unencoded_body = _body_for_upstream(decoded_body, payload, target)
+        compressed_body = zstandard.ZstdCompressor(level=_CODEX_REQUEST_COMPRESSION_LEVEL).compress(unencoded_body)
+        verbose_proxy_logger.debug(
+            "raw_codex_passthrough: deployment %s compressed request %d -> %d bytes with zstd",
+            target.model_name,
+            len(unencoded_body),
+            len(compressed_body),
+        )
+        return compressed_body, "zstd"
+
+    body = _body_for_upstream(raw_body, payload, target)
+    upstream_encoding = request_encoding if body is raw_body else None
+    return body, upstream_encoding
+
+
+def _with_content_encoding(
+    headers: list[tuple[bytes, bytes]],
+    content_encoding: str | None,
+) -> list[tuple[bytes, bytes]]:
+    without_encoding = [(name, value) for name, value in headers if name.lower() != b"content-encoding"]
+    if content_encoding is None:
+        return without_encoding
+    return [*without_encoding, (b"content-encoding", content_encoding.encode())]
+
+
 def _replays_web_search_call(payload: dict) -> bool:
     items = payload.get("input")
     if not isinstance(items, list):
@@ -325,15 +402,22 @@ def _dump_bodies(raw_body: bytes, body: bytes) -> None:
 async def _forward(
     request: Request,
     raw_body: bytes,
+    decoded_body: bytes,
+    request_encoding: str | None,
     payload: dict,
     target: RawPassthroughTarget,
 ) -> Response:
     access_token = Authenticator().get_access_token()
     headers = _build_forward_headers(request, payload, access_token)
-    body = _body_for_upstream(raw_body, payload, target)
+    body, upstream_encoding = _prepare_upstream_body(
+        raw_body,
+        decoded_body,
+        payload,
+        target,
+        request_encoding,
+    )
+    headers = _with_content_encoding(headers, upstream_encoding)
     _dump_bodies(raw_body, body)
-    if body is not raw_body:
-        headers = [(name, value) for name, value in headers if name.lower() != b"content-encoding"]
 
     client = await _get_shared_client()
     try:
@@ -351,6 +435,7 @@ async def _forward(
         if refreshed:
             await upstream.aclose()
             headers = _build_forward_headers(request, payload, refreshed)
+            headers = _with_content_encoding(headers, upstream_encoding)
             upstream = await _send(client, target, headers, body)
 
     response_headers = {
@@ -395,11 +480,12 @@ async def try_raw_codex_passthrough(request: Request, llm_router: Any) -> Respon
         return None
     if not raw_body:
         return None
-    try:
-        payload = json.loads(raw_body)
-    except Exception:  # noqa: BLE001 - normal pipeline reports malformed JSON
+    request_encoding = request.headers.get("content-encoding")
+    decoded_body = _decode_request_body(raw_body, request_encoding)
+    if decoded_body is None:
         return None
-    if not isinstance(payload, dict):
+    payload = _decoded_payload(decoded_body)
+    if payload is None:
         return None
     model_name = payload.get("model")
     if not isinstance(model_name, str) or not model_name:
@@ -413,7 +499,5 @@ async def try_raw_codex_passthrough(request: Request, llm_router: Any) -> Respon
     if target is None:
         return None
 
-    verbose_proxy_logger.debug(
-        "raw_codex_passthrough: %s -> %s (byte-exact)", model_name, target.upstream_url
-    )
-    return await _forward(request, raw_body, payload, target)
+    verbose_proxy_logger.debug("raw_codex_passthrough: %s -> %s (byte-exact)", model_name, target.upstream_url)
+    return await _forward(request, raw_body, decoded_body, request_encoding, payload, target)

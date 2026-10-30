@@ -1,11 +1,18 @@
 """Unit tests for the byte-exact ChatGPT subscription passthrough."""
 
+import gzip
 import json
 from unittest.mock import MagicMock
+
+import pytest
+import zstandard
 
 from litellm.proxy.response_api_endpoints.raw_codex_passthrough import (
     RawPassthroughTarget,
     _body_for_upstream,
+    _decode_request_body,
+    _decoded_payload,
+    _prepare_upstream_body,
     _resolve_target,
     _web_search_compat_payload,
 )
@@ -76,6 +83,42 @@ def test_api_base_naming_the_endpoint_is_not_doubled():
 
     assert target is not None
     assert target.upstream_url == "https://example.test/backend-api/codex/responses"
+
+
+def test_zstd_request_compression_is_resolved_from_deployment():
+    router = _router_with(
+        [
+            (
+                "gpt",
+                {
+                    "model": "chatgpt/gpt-6-luna",
+                    "raw_codex_request_compression": "zstd",
+                },
+            )
+        ]
+    )
+
+    target = _resolve_target(router, "gpt")
+
+    assert target is not None
+    assert target.request_compression == "zstd"
+
+
+def test_unknown_request_compression_is_rejected():
+    router = _router_with(
+        [
+            (
+                "gpt",
+                {
+                    "model": "chatgpt/gpt-6-luna",
+                    "raw_codex_request_compression": "gzip",
+                },
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must be omitted, false, or 'zstd'"):
+        _resolve_target(router, "gpt")
 
 
 def test_body_is_forwarded_untouched_when_the_model_names_match():
@@ -153,3 +196,67 @@ def test_model_and_declaration_rewrites_combine():
 
     assert parsed["model"] == "gpt-6.1-sol-2026"
     assert parsed["tools"] == [{"type": "web_search", "external_web_access": False}]
+
+
+def test_configured_zstd_compression_covers_all_request_rewrites():
+    payload = _compaction_shaped_payload(tools_marker=[])
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    target = RawPassthroughTarget(
+        "gpt-6.1-sol",
+        "gpt-6.1-sol-2026",
+        "https://example.test/responses",
+        request_compression="zstd",
+    )
+
+    compressed, encoding = _prepare_upstream_body(raw, raw, payload, target, None)
+
+    assert encoding == "zstd"
+    decoded = json.loads(zstandard.ZstdDecompressor().decompress(compressed))
+    assert decoded["model"] == "gpt-6.1-sol-2026"
+    assert decoded["tools"] == [{"type": "web_search", "external_web_access": False}]
+    assert decoded["input"] == payload["input"]
+
+
+def test_configured_zstd_compression_replaces_incoming_gzip_encoding():
+    raw_payload = b'{"model":"gpt-6-luna","input":[]}'
+    gzip_body = gzip.compress(raw_payload)
+    decoded = gzip.decompress(gzip_body)
+    target = RawPassthroughTarget(
+        "gpt-6-luna",
+        "gpt-6-luna",
+        "https://example.test/responses",
+        request_compression="zstd",
+    )
+
+    compressed, encoding = _prepare_upstream_body(
+        gzip_body,
+        decoded,
+        json.loads(decoded),
+        target,
+        "gzip",
+    )
+
+    assert encoding == "zstd"
+    assert zstandard.ZstdDecompressor().decompress(compressed) == raw_payload
+
+
+def test_compressed_request_is_not_altered_without_configured_compression():
+    raw_payload = b'{"model":"gpt-6-luna","input":[{"type":"reasoning","encrypted_content":"gAAAA_KEEP"}]}'
+    compressed = zstandard.ZstdCompressor().compress(raw_payload)
+    decoded = _decode_request_body(compressed, "zstd")
+    assert decoded is not None
+    payload = _decoded_payload(decoded)
+    assert payload is not None
+    target = RawPassthroughTarget("gpt-6-luna", "gpt-6-luna", "https://example.test/responses")
+
+    forwarded, encoding = _prepare_upstream_body(
+        compressed,
+        decoded,
+        payload,
+        target,
+        "zstd",
+    )
+
+    assert forwarded is compressed
+    assert encoding == "zstd"
+    assert payload["input"][0]["encrypted_content"] == "gAAAA_KEEP"
